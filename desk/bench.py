@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import datetime
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -81,6 +82,7 @@ class Row:
     latency_s: float = 0.0
     ttft_s: Optional[float] = None
     usage: Usage = field(default_factory=Usage)
+    category: Optional[str] = None
 
 
 def prompt(cand: Candidate, row: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -126,13 +128,15 @@ async def run_candidate(
                 )
             except LLMError:
                 return Row(row["id"], ok=False, failed=True)
+        category = parse_category(res.text)
         return Row(
             row["id"],
-            parse_category(res.text) == row["gold"]["category"],
+            category == row["gold"]["category"],
             truncated=res.truncated,
             latency_s=res.total_s,
             ttft_s=res.ttft_s,
             usage=res.usage,
+            category=category,
         )
 
     return list(await asyncio.gather(*(one(r) for r in rows)))
@@ -177,6 +181,17 @@ def table(rows: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def print_errors(name: str, sources: List[Dict[str, Any]], results: List[Row]) -> None:
+    sources_by_id = {row["id"]: row for row in sources}
+    errors = [row for row in results if not row.ok]
+    print("\nДля модели %s: ошибок %d из %d" % (name, len(errors), len(results)))
+    for row in errors[:5]:
+        source = sources_by_id[row.id]
+        print("  %s  эталон: %s  модель: %s\n    %s" % (
+            row.id, source["gold"]["category"], row.category, source["text"],
+        ))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -199,7 +214,8 @@ def main() -> None:
         ]
 
     results, spent = [], 0.0
-    for cand, done in zip(chosen, asyncio.run(run_all())):
+    all_results = asyncio.run(run_all())
+    for cand, done in zip(chosen, all_results):
         spent += sum(r.usage.weighted for r in done)
         results.append(summarize(cand.name, done, args.flow))
     report = table(results)
@@ -210,6 +226,8 @@ def main() -> None:
         % (llm.cfg.model, len(rows), args.flow, time.time() - started, spent)
     )
     print(footer)
+    for cand, done in zip(chosen, all_results):
+        print_errors(cand.name, rows, done)
     RUNS.mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     (RUNS / "s1_bench.md").write_text(
